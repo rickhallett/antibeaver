@@ -1,20 +1,19 @@
 /**
- * Thought Buffer Plugin v0.2.0
+ * Antibeaver Plugin v0.2.1
  * 
- * Write-behind buffering with SQLite storage and intelligent coalescing.
+ * Traffic governance for multi-agent systems.
+ * Circuit breaker and coalescing buffer for OpenClaw.
  * 
- * Architecture:
- *   Agent Thought → buffer_thought tool → SQLite → Coalesce → Channel
- * 
- * Storage: ~/.openclaw/buffers/thoughts.db (SQLite with WAL mode)
+ * Storage: ~/.openclaw/antibeaver/governance.db (SQLite with WAL mode)
  * 
  * Commands:
- *   /buffer        - Show buffer status for all agents
- *   /buffer on     - Force buffering mode (manual override)
+ *   /buffer        - Show buffer status
+ *   /buffer on     - Force buffering mode
  *   /buffer off    - Disable forced buffering
  *   /buffer simulate <ms> - Simulate latency for testing
- *   /flush         - Trigger synthesis for current session's agent
- *   /flush all     - Trigger synthesis for all agents with pending buffers
+ *   /flush         - Trigger synthesis
+ *   /flush all     - Trigger synthesis for all agents
+ *   /halt          - Kill switch (P0 interrupt)
  * 
  * Tools:
  *   buffer_thought    - Buffer a thought instead of sending directly
@@ -36,19 +35,9 @@ interface BufferedThought {
   channel: string;
   target: string;
   content: string;
-  priority: 'low' | 'normal' | 'high';
+  priority: 'P0' | 'P1' | 'P2';
   created_at: string;
-  synthesized_at: string | null;
-  discarded: number;
-  metadata: string | null;
-}
-
-interface LatencySample {
-  id: number;
-  recorded_at: string;
-  latency_ms: number;
-  channel: string | null;
-  agent_id: string | null;
+  status: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -58,23 +47,20 @@ interface LatencySample {
 let db: Database.Database | null = null;
 let globalForcedBuffering = false;
 let simulatedLatencyMs = 0;
+let systemHalted = false;
 
-// In-memory latency tracker for fast queries
 const latencyTracker = {
-  samples: [] as { ts: number; latencyMs: number; channel?: string }[],
+  samples: [] as { ts: number; latencyMs: number }[],
   maxSamples: 100,
   
-  record(latencyMs: number, channel?: string) {
-    this.samples.push({ ts: Date.now(), latencyMs, channel });
-    if (this.samples.length > this.maxSamples) {
-      this.samples.shift();
-    }
+  record(latencyMs: number) {
+    this.samples.push({ ts: Date.now(), latencyMs });
+    if (this.samples.length > this.maxSamples) this.samples.shift();
   },
   
-  getAverage(windowMs = 60000, channel?: string): number {
+  getAverage(windowMs = 60000): number {
     const now = Date.now();
-    let recent = this.samples.filter(s => now - s.ts < windowMs);
-    if (channel) recent = recent.filter(s => s.channel === channel);
+    const recent = this.samples.filter(s => now - s.ts < windowMs);
     if (recent.length === 0) return simulatedLatencyMs;
     return Math.max(
       recent.reduce((sum, s) => sum + s.latencyMs, 0) / recent.length,
@@ -82,28 +68,26 @@ const latencyTracker = {
     );
   },
   
-  getMax(windowMs = 60000, channel?: string): number {
+  getMax(windowMs = 60000): number {
     const now = Date.now();
-    let recent = this.samples.filter(s => now - s.ts < windowMs);
-    if (channel) recent = recent.filter(s => s.channel === channel);
+    const recent = this.samples.filter(s => now - s.ts < windowMs);
     if (recent.length === 0) return simulatedLatencyMs;
     return Math.max(...recent.map(s => s.latencyMs), simulatedLatencyMs);
   }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// DATABASE SETUP
+// DATABASE
 // ═══════════════════════════════════════════════════════════════════════════
 
-function initDatabase(bufferDir: string): Database.Database {
-  fs.mkdirSync(bufferDir, { recursive: true });
-  const dbPath = path.join(bufferDir, 'thoughts.db');
+function initDatabase(dbDir: string): Database.Database {
+  fs.mkdirSync(dbDir, { recursive: true });
+  const dbPath = path.join(dbDir, 'governance.db');
   
   const database = new Database(dbPath);
   database.pragma('journal_mode = WAL');
   database.pragma('synchronous = NORMAL');
   
-  // Create tables
   database.exec(`
     CREATE TABLE IF NOT EXISTS buffered_thoughts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,38 +95,28 @@ function initDatabase(bufferDir: string): Database.Database {
       channel TEXT NOT NULL,
       target TEXT DEFAULT '',
       content TEXT NOT NULL,
-      priority TEXT DEFAULT 'normal' CHECK(priority IN ('low', 'normal', 'high')),
+      priority TEXT DEFAULT 'P1' CHECK(priority IN ('P0', 'P1', 'P2')),
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      synthesized_at TEXT,
-      discarded INTEGER DEFAULT 0,
-      metadata TEXT
+      status TEXT DEFAULT 'pending'
     );
     
     CREATE INDEX IF NOT EXISTS idx_pending 
-      ON buffered_thoughts(agent_id, synthesized_at) 
-      WHERE synthesized_at IS NULL AND discarded = 0;
+      ON buffered_thoughts(agent_id, status) 
+      WHERE status = 'pending';
     
-    CREATE INDEX IF NOT EXISTS idx_agent_created 
-      ON buffered_thoughts(agent_id, created_at);
-    
-    CREATE TABLE IF NOT EXISTS latency_samples (
+    CREATE TABLE IF NOT EXISTS network_metrics (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      recorded_at TEXT NOT NULL DEFAULT (datetime('now')),
       latency_ms INTEGER NOT NULL,
-      channel TEXT,
-      agent_id TEXT
+      queue_depth INTEGER,
+      recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     
-    CREATE INDEX IF NOT EXISTS idx_latency_time 
-      ON latency_samples(recorded_at);
-    
-    CREATE TABLE IF NOT EXISTS synthesis_log (
+    CREATE TABLE IF NOT EXISTS synthesis_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       agent_id TEXT NOT NULL,
-      triggered_at TEXT NOT NULL DEFAULT (datetime('now')),
-      thought_count INTEGER,
-      result TEXT CHECK(result IN ('sent', 'discarded', 'partial', 'pending')),
-      output_content TEXT
+      thoughts_count INTEGER,
+      final_output TEXT,
+      triggered_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
   
@@ -150,174 +124,102 @@ function initDatabase(bufferDir: string): Database.Database {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// HELPER FUNCTIONS
+// HELPERS
 // ═══════════════════════════════════════════════════════════════════════════
 
 function getPendingThoughts(agentId: string): BufferedThought[] {
   if (!db) return [];
-  const stmt = db.prepare(`
+  return db.prepare(`
     SELECT * FROM buffered_thoughts 
-    WHERE agent_id = ? AND synthesized_at IS NULL AND discarded = 0
-    ORDER BY created_at ASC
-  `);
-  return stmt.all(agentId) as BufferedThought[];
+    WHERE agent_id = ? AND status = 'pending'
+    ORDER BY priority ASC, created_at ASC
+  `).all(agentId) as BufferedThought[];
 }
 
 function getAllPendingAgents(): string[] {
   if (!db) return [];
-  const stmt = db.prepare(`
-    SELECT DISTINCT agent_id FROM buffered_thoughts 
-    WHERE synthesized_at IS NULL AND discarded = 0
-  `);
-  return (stmt.all() as { agent_id: string }[]).map(r => r.agent_id);
+  return (db.prepare(`
+    SELECT DISTINCT agent_id FROM buffered_thoughts WHERE status = 'pending'
+  `).all() as { agent_id: string }[]).map(r => r.agent_id);
 }
 
 function getPendingCount(agentId?: string): number {
   if (!db) return 0;
   if (agentId) {
-    const stmt = db.prepare(`
+    return (db.prepare(`
       SELECT COUNT(*) as count FROM buffered_thoughts 
-      WHERE agent_id = ? AND synthesized_at IS NULL AND discarded = 0
-    `);
-    return (stmt.get(agentId) as { count: number }).count;
+      WHERE agent_id = ? AND status = 'pending'
+    `).get(agentId) as { count: number }).count;
   }
-  const stmt = db.prepare(`
-    SELECT COUNT(*) as count FROM buffered_thoughts 
-    WHERE synthesized_at IS NULL AND discarded = 0
-  `);
-  return (stmt.get() as { count: number }).count;
+  return (db.prepare(`
+    SELECT COUNT(*) as count FROM buffered_thoughts WHERE status = 'pending'
+  `).get() as { count: number }).count;
 }
 
-function insertThought(
-  agentId: string,
-  channel: string,
-  target: string,
-  content: string,
-  priority: string,
-  metadata?: Record<string, unknown>
-): number {
+function insertThought(agentId: string, channel: string, target: string, content: string, priority: string): number {
   if (!db) return -1;
-  const stmt = db.prepare(`
-    INSERT INTO buffered_thoughts (agent_id, channel, target, content, priority, metadata)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `);
-  const result = stmt.run(
-    agentId,
-    channel,
-    target || '',
-    content,
-    priority || 'normal',
-    metadata ? JSON.stringify(metadata) : null
-  );
+  const result = db.prepare(`
+    INSERT INTO buffered_thoughts (agent_id, channel, target, content, priority)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(agentId, channel, target || '', content, priority || 'P1');
   return result.lastInsertRowid as number;
 }
 
-function markSynthesized(agentId: string, result: string, output?: string): void {
+function markSynthesized(agentId: string, output?: string): void {
   if (!db) return;
-  
   const thoughts = getPendingThoughts(agentId);
-  const thoughtIds = thoughts.map(t => t.id);
+  if (thoughts.length === 0) return;
   
-  if (thoughtIds.length === 0) return;
-  
-  // Mark thoughts as synthesized
-  const updateStmt = db.prepare(`
-    UPDATE buffered_thoughts 
-    SET synthesized_at = datetime('now')
-    WHERE id IN (${thoughtIds.join(',')})
-  `);
-  updateStmt.run();
-  
-  // Log the synthesis
-  const logStmt = db.prepare(`
-    INSERT INTO synthesis_log (agent_id, thought_count, result, output_content)
-    VALUES (?, ?, ?, ?)
-  `);
-  logStmt.run(agentId, thoughtIds.length, result, output || null);
+  const ids = thoughts.map(t => t.id);
+  db.prepare(`UPDATE buffered_thoughts SET status = 'synthesized' WHERE id IN (${ids.join(',')})`).run();
+  db.prepare(`INSERT INTO synthesis_events (agent_id, thoughts_count, final_output) VALUES (?, ?, ?)`).run(agentId, ids.length, output || null);
 }
 
-function shouldBuffer(latencyThreshold: number): { buffering: boolean; reason: string; latencyMs: number } {
-  const avgLatency = latencyTracker.getAverage();
+function shouldBuffer(threshold: number): { buffering: boolean; reason: string; latencyMs: number } {
+  if (systemHalted) return { buffering: true, reason: 'SYSTEM HALTED', latencyMs: 0 };
+  if (globalForcedBuffering) return { buffering: true, reason: 'manual override', latencyMs: latencyTracker.getAverage() };
+  if (simulatedLatencyMs > threshold) return { buffering: true, reason: `simulated ${simulatedLatencyMs}ms`, latencyMs: simulatedLatencyMs };
+  
   const maxLatency = latencyTracker.getMax();
+  if (maxLatency > threshold) return { buffering: true, reason: `latency ${Math.round(maxLatency)}ms > ${threshold}ms`, latencyMs: maxLatency };
   
-  if (globalForcedBuffering) {
-    return { buffering: true, reason: 'manual override (/buffer on)', latencyMs: avgLatency };
-  }
-  
-  if (simulatedLatencyMs > latencyThreshold) {
-    return { buffering: true, reason: `simulated latency ${simulatedLatencyMs}ms`, latencyMs: simulatedLatencyMs };
-  }
-  
-  if (maxLatency > latencyThreshold) {
-    return { buffering: true, reason: `latency ${Math.round(maxLatency)}ms > ${latencyThreshold}ms threshold`, latencyMs: maxLatency };
-  }
-  
-  return { buffering: false, reason: 'queue healthy', latencyMs: avgLatency };
-}
-
-function shouldDrain(drainThreshold: number): boolean {
-  if (globalForcedBuffering) return false;
-  if (simulatedLatencyMs > 0) return false;
-  const avgLatency = latencyTracker.getAverage();
-  return avgLatency < drainThreshold;
+  return { buffering: false, reason: 'healthy', latencyMs: latencyTracker.getAverage() };
 }
 
 function generateSynthesisPrompt(thoughts: BufferedThought[]): string {
-  // Sort by priority (high first) then by time
-  const priorityOrder = { high: 0, normal: 1, low: 2 };
-  const sorted = [...thoughts].sort((a, b) => {
-    const pDiff = priorityOrder[a.priority] - priorityOrder[b.priority];
-    if (pDiff !== 0) return pDiff;
-    return new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
-  });
+  const formatted = thoughts.map((t, i) => {
+    const tag = t.priority === 'P0' ? ' [CRITICAL]' : t.priority === 'P2' ? ' [low]' : '';
+    return `${i + 1}. [${t.created_at}]${tag} "${t.content}"`;
+  }).join('\n');
 
-  const formattedThoughts = sorted
-    .map((t, i) => {
-      const priorityTag = t.priority === 'high' ? ' [HIGH PRIORITY]' : t.priority === 'low' ? ' [low]' : '';
-      return `${i + 1}. [${t.created_at}]${priorityTag} "${t.content}"`;
-    })
-    .join('\n');
+  return `**SYSTEM: NETWORK RECOVERED**
 
-  const highPriorityCount = sorted.filter(t => t.priority === 'high').length;
-  const highPriorityNote = highPriorityCount > 0 
-    ? `\n\n**Note:** ${highPriorityCount} thought(s) marked HIGH PRIORITY — these should be preserved unless clearly obsolete.`
-    : '';
+While congested, you drafted ${thoughts.length} messages:
 
-  return `**SYSTEM EVENT: NETWORK RECOVERED**
+${formatted}
 
-While the network was congested, you attempted to send ${thoughts.length} messages that were buffered:
-
-${formattedThoughts}
-${highPriorityNote}
-
-**INSTRUCTION:**
-Review these buffered thoughts against the current state of the conversation.
-- If they are obsolete (already addressed, superseded, no longer relevant), discard them.
-- If they are still relevant, **synthesize them into ONE concise, coherent message**.
-- Preserve the essence of HIGH PRIORITY thoughts unless clearly obsolete.
-- Do not apologize for delays or mention the buffering system.
-
-Respond with your synthesized message, or "NO_REPLY" if all thoughts are obsolete.`;
+**TASK:** Review against current channel state.
+- Discard obsolete/superseded thoughts
+- Synthesize remaining into ONE coherent message
+- Do not apologize or mention delays`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// PLUGIN REGISTRATION
+// PLUGIN
 // ═══════════════════════════════════════════════════════════════════════════
 
 export default function register(api: PluginAPI) {
   const logger = api.logger;
-  const config = api.config?.plugins?.entries?.['thought-buffer']?.config ?? {};
-  const latencyThreshold = config.latencyThresholdMs ?? 10000;
-  const drainThreshold = config.drainThresholdMs ?? 5000;
-  const bufferDir = (config.bufferDir ?? '~/.openclaw/buffers').replace('~', process.env.HOME || '');
-  const maxBufferSize = config.maxBufferSize ?? 20;
+  const pluginConfig = api.config?.plugins?.entries?.['antibeaver']?.config ?? {};
+  const latencyThreshold = pluginConfig.latencyThresholdMs ?? 5000;
+  const dbDir = (pluginConfig.dbPath ?? '~/.openclaw/antibeaver').replace('~', process.env.HOME || '');
+  const maxBuffer = pluginConfig.maxBufferSize ?? 50;
 
-  // Initialize SQLite
   try {
-    db = initDatabase(bufferDir);
-    logger.info(`[thought-buffer] SQLite database initialized at ${bufferDir}/thoughts.db`);
+    db = initDatabase(dbDir);
+    logger.info(`[antibeaver] SQLite initialized: ${dbDir}/governance.db`);
   } catch (err) {
-    logger.error(`[thought-buffer] Failed to initialize SQLite: ${err}`);
+    logger.error(`[antibeaver] DB init failed: ${err}`);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -326,95 +228,92 @@ export default function register(api: PluginAPI) {
   
   api.registerTool({
     name: 'buffer_thought',
-    description: `Buffer a thought instead of sending directly. Use when the system indicates network congestion, or when you want to accumulate thoughts before sending a coherent message. Buffered thoughts are synthesized into a single message when network health recovers.`,
+    description: 'Buffer a thought instead of sending directly. Use when system indicates network congestion.',
     parameters: {
       type: 'object',
       properties: {
-        thought: {
-          type: 'string',
-          description: 'The thought/message content to buffer',
-        },
-        channel: {
-          type: 'string',
-          description: 'Target channel (e.g., "slack", "telegram")',
-        },
-        target: {
-          type: 'string',
-          description: 'Target destination (channel name or user ID)',
-        },
-        priority: {
-          type: 'string',
-          enum: ['low', 'normal', 'high'],
-          description: 'Priority level. High priority thoughts are preserved during synthesis unless clearly obsolete.',
-        },
+        thought: { type: 'string', description: 'The thought/message to buffer' },
+        channel: { type: 'string', description: 'Target channel (slack, telegram, etc.)' },
+        target: { type: 'string', description: 'Target destination' },
+        priority: { type: 'string', enum: ['P0', 'P1', 'P2'], description: 'P0=critical, P1=normal, P2=low' },
       },
       required: ['thought'],
     },
-    handler: async ({ thought, channel, target, priority }, ctx) => {
-      const agentId = ctx.agentId || 'main';
+    async execute(_id, params) {
+      const { thought, channel, target, priority } = params as { thought: string; channel?: string; target?: string; priority?: string };
+      const agentId = 'main'; // TODO: extract from context when available
       
-      const id = insertThought(
-        agentId,
-        channel || ctx.channel || 'unknown',
-        target || '',
-        thought,
-        priority || 'normal',
-        { sessionKey: ctx.sessionKey }
-      );
-      
+      const id = insertThought(agentId, channel || 'unknown', target || '', thought, priority || 'P1');
       const count = getPendingCount(agentId);
-      const bufferStatus = shouldBuffer(latencyThreshold);
       
-      logger.info(`[thought-buffer] Buffered thought #${id} for ${agentId}: "${thought.substring(0, 50)}..." (${count} total)`);
+      logger.info(`[antibeaver] Buffered #${id}: "${thought.substring(0, 40)}..." (${count} pending)`);
       
-      if (count >= maxBufferSize) {
-        return {
-          ok: true,
-          buffered: true,
-          thoughtId: id,
-          count,
-          warning: `Buffer at capacity (${maxBufferSize}). Consider triggering synthesis.`,
-          hint: 'Buffer is full. Synthesis should be triggered soon.',
-        };
-      }
+      const warning = count >= maxBuffer ? ` Buffer at capacity (${maxBuffer}).` : '';
       
       return {
-        ok: true,
-        buffered: true,
-        thoughtId: id,
-        count,
-        reason: bufferStatus.reason,
-        hint: 'Message buffered. Do not retry. It will be synthesized when network recovers.',
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            ok: true,
+            buffered: true,
+            id,
+            pending: count,
+            hint: `Thought buffered. Do not retry.${warning}`
+          })
+        }]
       };
     },
   });
 
   // ═══════════════════════════════════════════════════════════════════════
-  // TOOL: get_buffer_status  
+  // TOOL: get_buffer_status
   // ═══════════════════════════════════════════════════════════════════════
 
   api.registerTool({
     name: 'get_buffer_status',
-    description: 'Check the current buffer status and queue health metrics.',
+    description: 'Check buffer status and queue health.',
     parameters: { type: 'object', properties: {} },
-    handler: async (_, ctx) => {
-      const agentId = ctx.agentId || 'main';
-      const pendingCount = getPendingCount(agentId);
-      const bufferStatus = shouldBuffer(latencyThreshold);
+    async execute() {
+      const status = shouldBuffer(latencyThreshold);
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            buffering: status.buffering,
+            reason: status.reason,
+            halted: systemHalted,
+            pending: getPendingCount(),
+            avgLatencyMs: Math.round(latencyTracker.getAverage()),
+            maxLatencyMs: Math.round(latencyTracker.getMax()),
+            threshold: latencyThreshold,
+            hint: status.buffering ? 'Use buffer_thought instead of direct messages.' : 'Queue healthy.'
+          })
+        }]
+      };
+    },
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // COMMAND: /halt
+  // ═══════════════════════════════════════════════════════════════════════
+
+  api.registerCommand({
+    name: 'halt',
+    description: 'Emergency halt - P0 interrupt, bypasses queue',
+    acceptsArgs: false,
+    requireAuth: true,
+    handler: async (ctx) => {
+      systemHalted = true;
+      const ts = new Date().toISOString();
+      logger.warn(`[antibeaver] 🚨 HALT by ${ctx.senderId} at ${ts}`);
       
       return {
-        agentId,
-        buffering: bufferStatus.buffering,
-        reason: bufferStatus.reason,
-        pendingThoughts: pendingCount,
-        totalPending: getPendingCount(),
-        avgLatencyMs: Math.round(latencyTracker.getAverage()),
-        maxLatencyMs: Math.round(latencyTracker.getMax()),
-        forcedBuffering: globalForcedBuffering,
-        simulatedLatencyMs,
-        hint: bufferStatus.buffering 
-          ? 'Use buffer_thought tool instead of direct messages.'
-          : 'Queue is healthy. Normal messaging is safe.',
+        text: `🚨 **SYSTEM HALTED**
+
+Time: ${ts}
+By: ${ctx.senderId}
+
+All agent output suspended. Send \`/buffer off\` to resume.`
       };
     },
   });
@@ -425,70 +324,56 @@ export default function register(api: PluginAPI) {
 
   api.registerCommand({
     name: 'buffer',
-    description: 'Buffer status and controls (on/off/simulate)',
+    description: 'Buffer status and controls',
     acceptsArgs: true,
     requireAuth: true,
     handler: async (ctx) => {
-      const args = ctx.args?.trim().toLowerCase().split(/\s+/) || [];
-      const subcommand = args[0];
+      const args = (ctx.args || '').trim().toLowerCase().split(/\s+/);
+      const cmd = args[0];
       
-      if (subcommand === 'on') {
+      if (cmd === 'on') {
         globalForcedBuffering = true;
-        return { text: `⏸️ **Forced buffering ENABLED**\n\nAll agents will buffer thoughts until \`/buffer off\`.` };
+        systemHalted = false;
+        return { text: `⏸️ **Buffering ENABLED**\n\nAll agents will buffer until \`/buffer off\`.` };
       }
       
-      if (subcommand === 'off') {
+      if (cmd === 'off') {
         globalForcedBuffering = false;
+        systemHalted = false;
         simulatedLatencyMs = 0;
-        return { text: `▶️ **Forced buffering DISABLED**\n\nAgents will use automatic latency-based buffering.` };
+        return { text: `▶️ **Buffering DISABLED**\n\nResumed automatic mode.` };
       }
       
-      if (subcommand === 'simulate') {
+      if (cmd === 'simulate') {
         const ms = parseInt(args[1] || '0', 10);
         simulatedLatencyMs = Math.max(0, ms);
+        systemHalted = false;
         if (simulatedLatencyMs > 0) {
-          return { text: `🧪 **Simulating ${simulatedLatencyMs}ms latency**\n\nBuffering will activate. Use \`/buffer off\` to disable.` };
+          return { text: `🧪 **Simulating ${simulatedLatencyMs}ms latency**` };
         }
-        return { text: `🧪 **Simulation disabled**\n\nReturned to real latency tracking.` };
+        return { text: `🧪 **Simulation off**` };
       }
       
-      // Show status
-      const bufferStatus = shouldBuffer(latencyThreshold);
-      const agentsWithPending = getAllPendingAgents();
-      
-      const agentLines = agentsWithPending.map(agentId => {
-        const count = getPendingCount(agentId);
-        const thoughts = getPendingThoughts(agentId);
-        const highCount = thoughts.filter(t => t.priority === 'high').length;
-        const highNote = highCount > 0 ? ` (${highCount} high priority)` : '';
-        return `  • **${agentId}**: ${count} thoughts${highNote}`;
-      });
+      // Status
+      const status = shouldBuffer(latencyThreshold);
+      const agents = getAllPendingAgents();
+      const agentLines = agents.map(a => `  • **${a}**: ${getPendingCount(a)} thoughts`);
       
       return {
-        text: `📊 **Thought Buffer Status**
+        text: `📊 **Antibeaver Status**
 
-**Mode:** ${bufferStatus.buffering ? '⏸️ BUFFERING' : '▶️ NORMAL'}
-**Reason:** ${bufferStatus.reason}
-
-**Controls:**
-  • Forced: ${globalForcedBuffering ? 'Yes' : 'No'}
-  • Simulated latency: ${simulatedLatencyMs > 0 ? `${simulatedLatencyMs}ms` : 'Off'}
+**Mode:** ${systemHalted ? '🚨 HALTED' : status.buffering ? '⏸️ BUFFERING' : '▶️ NORMAL'}
+**Reason:** ${status.reason}
 
 **Queue Health:**
-  • Avg Latency: ${Math.round(latencyTracker.getAverage())}ms
-  • Max Latency: ${Math.round(latencyTracker.getMax())}ms
-  • Buffer threshold: ${latencyThreshold}ms
-  • Drain threshold: ${drainThreshold}ms
+  • Avg: ${Math.round(latencyTracker.getAverage())}ms
+  • Max: ${Math.round(latencyTracker.getMax())}ms
+  • Threshold: ${latencyThreshold}ms
 
-**Pending Buffers (${getPendingCount()} total):**
+**Pending (${getPendingCount()} total):**
 ${agentLines.length > 0 ? agentLines.join('\n') : '  (none)'}
 
-**Commands:**
-  \`/buffer on\` — Force buffering
-  \`/buffer off\` — Disable forced buffering  
-  \`/buffer simulate 15000\` — Simulate 15s latency
-  \`/flush\` — Synthesize buffered thoughts
-  \`/flush all\` — Synthesize for all agents`
+**Commands:** \`/buffer on|off\`, \`/buffer simulate <ms>\`, \`/flush\`, \`/halt\``
       };
     },
   });
@@ -499,132 +384,57 @@ ${agentLines.length > 0 ? agentLines.join('\n') : '  (none)'}
 
   api.registerCommand({
     name: 'flush',
-    description: 'Synthesize buffered thoughts',
+    description: 'Trigger synthesis of buffered thoughts',
     acceptsArgs: true,
     requireAuth: true,
     handler: async (ctx) => {
-      const args = ctx.args?.trim().toLowerCase();
-      const flushAll = args === 'all';
+      const flushAll = (ctx.args || '').trim().toLowerCase() === 'all';
+      const agents = flushAll ? getAllPendingAgents() : ['main'];
       
-      const agentsToFlush = flushAll 
-        ? getAllPendingAgents()
-        : getAllPendingAgents().filter(id => id === 'main'); // Default to main
-      
-      if (agentsToFlush.length === 0) {
-        return { text: `📭 No pending thoughts to flush.` };
+      if (agents.length === 0 || getPendingCount() === 0) {
+        return { text: `📭 No pending thoughts.` };
       }
       
       const results: string[] = [];
-      
-      for (const agentId of agentsToFlush) {
+      for (const agentId of agents) {
         const thoughts = getPendingThoughts(agentId);
         if (thoughts.length === 0) continue;
         
-        const synthesisPrompt = generateSynthesisPrompt(thoughts);
-        
-        // Mark as pending synthesis (will be marked complete when agent responds)
-        markSynthesized(agentId, 'pending', synthesisPrompt);
-        
-        results.push(`### ${agentId} (${thoughts.length} thoughts)\n\n${synthesisPrompt}`);
+        const prompt = generateSynthesisPrompt(thoughts);
+        markSynthesized(agentId, prompt);
+        results.push(`### ${agentId} (${thoughts.length} thoughts)\n\n${prompt}`);
       }
       
-      return {
-        text: `🔄 **SYNTHESIS REQUIRED**
-
-The following buffers have been marked for synthesis. Each agent should process their prompt:
-
----
-
-${results.join('\n\n---\n\n')}`
-      };
+      return { text: `🔄 **SYNTHESIS**\n\n${results.join('\n\n---\n\n')}` };
     },
   });
 
   // ═══════════════════════════════════════════════════════════════════════
-  // HOOK: agent:bootstrap — Inject buffer context
+  // RPC: Record latency
   // ═══════════════════════════════════════════════════════════════════════
 
-  api.registerHook('agent:bootstrap', async (event) => {
-    const agentId = event.context?.agentId || 'main';
-    const pendingThoughts = getPendingThoughts(agentId);
-    const bufferStatus = shouldBuffer(latencyThreshold);
-    
-    // If we have pending thoughts and queue has recovered, inject synthesis prompt
-    if (pendingThoughts.length > 0 && shouldDrain(drainThreshold)) {
-      const synthesisPrompt = generateSynthesisPrompt(pendingThoughts);
-      
-      event.context.bootstrapFiles = event.context.bootstrapFiles || [];
-      event.context.bootstrapFiles.push({
-        path: 'BUFFER_RECOVERY.md',
-        content: synthesisPrompt,
-        source: 'plugin:thought-buffer',
-      });
-      
-      // Mark as synthesized
-      markSynthesized(agentId, 'pending', synthesisPrompt);
-      
-      logger.info(`[thought-buffer] Injected synthesis prompt for ${agentId} (${pendingThoughts.length} thoughts)`);
-    }
-    
-    // If buffering is active, inject warning
-    if (bufferStatus.buffering) {
-      event.context.bootstrapFiles = event.context.bootstrapFiles || [];
-      event.context.bootstrapFiles.push({
-        path: 'BUFFER_WARNING.md',
-        content: `⚠️ **NETWORK CONGESTION DETECTED**
-
-Queue latency: ${Math.round(bufferStatus.latencyMs)}ms (threshold: ${latencyThreshold}ms)
-Reason: ${bufferStatus.reason}
-
-**INSTRUCTION:** Do not send messages directly. Use the \`buffer_thought\` tool instead.
-Your thoughts will be buffered and synthesized into coherent messages when the network recovers.
-
-This prevents feedback loops where delayed messages trigger stale responses.`,
-        source: 'plugin:thought-buffer',
-      });
-    }
-  });
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // GATEWAY RPC: Latency recording
-  // ═══════════════════════════════════════════════════════════════════════
-
-  api.registerGatewayMethod('thought-buffer.recordLatency', ({ respond }, params) => {
-    const { latencyMs, channel, agentId } = params as { latencyMs: number; channel?: string; agentId?: string };
-    latencyTracker.record(latencyMs, channel);
-    
-    // Also persist to SQLite for historical analysis
+  api.registerGatewayMethod('antibeaver.recordLatency', ({ respond }, params) => {
+    const { latencyMs } = params as { latencyMs: number };
+    latencyTracker.record(latencyMs);
     if (db) {
-      const stmt = db.prepare(`
-        INSERT INTO latency_samples (latency_ms, channel, agent_id)
-        VALUES (?, ?, ?)
-      `);
-      stmt.run(latencyMs, channel || null, agentId || null);
+      db.prepare(`INSERT INTO network_metrics (latency_ms) VALUES (?)`).run(latencyMs);
     }
-    
-    respond(true, { 
-      recorded: true, 
-      avgLatency: Math.round(latencyTracker.getAverage()),
-      buffering: shouldBuffer(latencyThreshold).buffering
-    });
+    respond(true, { recorded: true, avg: Math.round(latencyTracker.getAverage()) });
   });
 
-  api.registerGatewayMethod('thought-buffer.getStatus', ({ respond }) => {
+  api.registerGatewayMethod('antibeaver.status', ({ respond }) => {
     const status = shouldBuffer(latencyThreshold);
     respond(true, {
       buffering: status.buffering,
       reason: status.reason,
-      avgLatencyMs: Math.round(latencyTracker.getAverage()),
-      maxLatencyMs: Math.round(latencyTracker.getMax()),
-      forcedBuffering: globalForcedBuffering,
-      simulatedLatencyMs,
-      pendingTotal: getPendingCount(),
-      agentsWithPending: getAllPendingAgents(),
+      halted: systemHalted,
+      pending: getPendingCount(),
+      agents: getAllPendingAgents()
     });
   });
 
-  logger.info('[thought-buffer] Thought Buffer v0.2.0 loaded (SQLite backend). Commands: /buffer, /flush. Tools: buffer_thought, get_buffer_status');
+  logger.info('[antibeaver] v0.2.1 loaded. Commands: /halt, /buffer, /flush. Tools: buffer_thought, get_buffer_status');
 }
 
-export const id = 'thought-buffer';
-export const name = 'Thought Buffer';
+export const id = 'antibeaver';
+export const name = 'Antibeaver';

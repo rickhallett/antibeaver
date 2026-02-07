@@ -1,7 +1,7 @@
 {
   "id": "antibeaver",
   "name": "Antibeaver",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Traffic governance for multi-agent systems. Circuit breaker and coalescing buffer that prevents distributed feedback loops.",
   "author": "HAL 🔴 + Kai",
   "homepage": "https://github.com/rickhallett/antibeaver",
