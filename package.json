@@ -1,9 +1,18 @@
 {
   "name": "antibeaver",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Traffic governance for multi-agent systems. Circuit breaker and coalescing buffer for OpenClaw.",
   "main": "src/index.ts",
   "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration",
+    "test:e2e": "vitest run tests/e2e",
+    "lint": "tsc --noEmit"
+  },
   "keywords": [
     "openclaw",
     "plugin",
@@ -24,7 +33,9 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",
-    "typescript": "^5.0.0"
+    "@vitest/coverage-v8": "^4.0.18",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
   },
   "engines": {
     "node": ">=22.0.0"
