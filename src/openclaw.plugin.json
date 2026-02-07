@@ -1,0 +1,52 @@
+{
+  "id": "antibeaver",
+  "name": "Antibeaver",
+  "version": "0.2.0",
+  "description": "Traffic governance for multi-agent systems. Circuit breaker and coalescing buffer that prevents distributed feedback loops.",
+  "author": "HAL 🔴 + Kai",
+  "homepage": "https://github.com/rickhallett/antibeaver",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "latencyThresholdMs": {
+        "type": "number",
+        "default": 5000,
+        "description": "Queue latency threshold (ms) before buffering activates (DEGRADED mode)"
+      },
+      "criticalThresholdMs": {
+        "type": "number",
+        "default": 30000,
+        "description": "Queue latency threshold (ms) for CRITICAL mode (total freeze)"
+      },
+      "drainThresholdMs": {
+        "type": "number",
+        "default": 3000,
+        "description": "Queue latency threshold (ms) to trigger automatic buffer drain"
+      },
+      "dbPath": {
+        "type": "string",
+        "default": "~/.openclaw/antibeaver/governance.db",
+        "description": "Path to SQLite database"
+      },
+      "maxBufferSize": {
+        "type": "number",
+        "default": 50,
+        "description": "Maximum thoughts to buffer per agent before forcing synthesis"
+      }
+    }
+  },
+  "uiHints": {
+    "latencyThresholdMs": {
+      "label": "Degraded Threshold (ms)",
+      "placeholder": "5000"
+    },
+    "criticalThresholdMs": {
+      "label": "Critical Threshold (ms)",
+      "placeholder": "30000"
+    },
+    "drainThresholdMs": {
+      "label": "Drain Threshold (ms)",
+      "placeholder": "3000"
+    }
+  }
+}

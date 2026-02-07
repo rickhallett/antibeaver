@@ -1,0 +1,36 @@
+{
+  "name": "antibeaver",
+  "version": "0.2.0",
+  "description": "Traffic governance for multi-agent systems. Circuit breaker and coalescing buffer for OpenClaw.",
+  "main": "src/index.ts",
+  "type": "module",
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "multi-agent",
+    "circuit-breaker",
+    "backpressure",
+    "distributed-systems",
+    "beaver"
+  ],
+  "author": "Kai Hallett <kai@oceanheart.ai>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rickhallett/antibeaver.git"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "openclaw": {
+    "extensions": ["./src/index.ts"],
+    "kind": "plugin"
+  }
+}
